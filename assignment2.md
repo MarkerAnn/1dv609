@@ -812,43 +812,36 @@ tidskrävande när man samtidigt ville dokumentera allt. Jag hittade en hel del
 som fungerade men också saker som jag skulle hanterat annorlunda som utvecklare:
 
 Det första jag upptäckte var efter jag loggat in och gick in på fliken
-`/budgets` och detta gav en HTTP statuskod - 500:
+`/budgets` och detta gav en 500 Internal Server Error på /budgets
 
-```plaintext
-Problem hittat: Budget-hantering 500-fel
-Symptom: Användare kunde inte komma åt /budgets utan att få ett 500-fel
-Root cause: Budget med "hourly" period fanns i databasen, men systemet saknade stöd för denna period
-```
+---
 
-**Förberedelse av testmiljö**
+**Orsak:**
 
-```php
-// Ursprunglig kod som orsakade problemet
-public function getSupportedPeriods(): array
-{
-    return ['yearly', 'monthly', 'weekly', 'daily'];
-}
-```
+1. **Data-Kod Missmatch:**
+   - I databasen fanns budgets med `period = 'hourly'`.
+   - I koden (BudgetRepository) fanns inte 'hourly' definierad som en giltig
+     period.
+   - Detta skapade en konflikt när systemet försökte hantera dessa budgets.
+2. **Felkedja:**
+   - Felet uppstod när systemet försökte bearbeta felaktiga data.
+3. **Ursprung till Problemet:**
+   - Ett test i `BudgetRepositoryTest.php` skapade budgets med
+     `period = 'hourly'`.
+   - Dessa budgets rensades inte bort efter testkörning.
+   - Datan persisterade i utvecklingsdatabasen och skapade konflikter med koden.
 
-- Systemet hade bara stöd för fyra periodtyper
-- Databasen innehöll en ogiltig periodtyp
-- Detta ledde till ett systemkritiskt fel
+---
 
-**Implementerad lösning**
+**Lösning:**
 
-```php
-// Uppdaterad kod med stöd för timbaserade budgetar
-public function getSupportedPeriods(): array
-{
-    return ['yearly', 'monthly', 'weekly', 'daily', 'hourly'];
-}
-```
-
-- La till 'hourly' som giltig period
-- Implementerade logik för timbaserade beräkningar
-- Förbättrade felhanteringen
-
-Jag har kontaktat utvecklaren om detta men inte fått något svar än.
+1. **Kortsiktig Fix:**
+   - Rensade databasen från `hourly` budgets.
+   - Återställde databasen till ett rent tillstånd.
+2. **Långsiktig Prevention (förslagsvis):**
+   - Implementerade `RefreshDatabase`-trait i testerna.
+   - Detta garanterar att testdata inte persisterar efter körning.
+   - Säkerställde att utvecklingsdatabasen hålls ren från test-artefakter.
 
 **Övriga upptäckta problem och observationer**
 
@@ -995,12 +988,29 @@ dominoeffekt av testfel:
    `BudgetRepository`-testerna. När ett test försöker skapa en användare med en
    e-postadress som redan finns, kraschar testet.
 
-2. Saknade valutakonverteringsdata: Det andra stora problemet handlar om
-   valutakonverteringar. När applikationen försöker konvertera mellan olika
-   valutor finns inte nödvändig konverteringsdata tillgänglig. Detta leder till
-   felet `Could not find conversion rate`. Detta problem är särskilt allvarligt
-   eftersom det orsakar ett 500-fel i `Recurring`-testet, vilket tyder på att
-   applikationen inte hanterar saknade konverteringsdata på ett bra sätt.
+2. Problem med CSRF. När jag körde testerna stötte jag på ett återkommande
+   problem där många tester misslyckades med felkod 419. I Laravel betyder denna
+   felkod "Page Expired" och visar att CSRF-skyddet (Cross-Site Request Forgery)
+   blockerade våra testanrop. Detta är ett vanligt förekommande fel.
+
+Efter felsökning och åtgärder har testresultaten förbättrats markant:
+
+**Slutgiltigt testresultat:**
+
+- Totalt antal tester: 93
+- Lyckade tester: 91 (97.8%)
+- Misslyckade assertions (Failures): 2
+- Totala assertions: 163
+
+Förbättringen uppnåddes genom följande åtgärder:
+
+1. Identifiering och åtgärd av CSRF-relaterade fel genom implementering av
+   `WithoutMiddleware` trait i berörda testfiler
+2. Rensning (manuell) av test-databasen efter varje test-körning
+3. Säkerställande av korrekt databashantering mellan testkörningar
+
+De två fel som kvarstår beror på kompabilitetskonflikt mellan PHP 8.2 och
+PHPUnit 9.6
 
 # Sammanfattning
 
@@ -1014,15 +1024,20 @@ och bättre täckning (coverage). Om fler tester hade inkluderat "icke happy
 paths" – alltså scenarier där saker går fel – hade designen troligen förbättrats
 och många av de svagheter jag upptäckt sannolikt undvikits.
 
-Det finns dock fortfarande saker jag inte förstår, framför allt när det kommer
-till buggarna jag stötte på under min granskning. Ett tydligt exempel är
-500-felet jag fick när jag gick in på routern `/budgets`. Varför har man inte
-lagt in stöd för `hourly` i metoden `getSupportedPeriods`? Det känns som en
-enkel lösning, men jag antar att det finns en bakomliggande anledning som jag
-inte greppar i nuläget. På samma sätt förstår jag inte varför vissa tester
-misslyckas på grund av duplicerade data, eller varför man valt att inte
-nollställa databasen mellan testkörningar. Det känns som ett medvetet val, men
-jag kan som novis inte helt se varför.
+Jag har fortfarande vissa oklarheter, särskilt när det gäller de buggar jag
+stötte på under granskningen. Ett tydligt exempel är 500-felet som uppstod när
+jag försökte nå routern `/budgets`. Efter felsökning visade det sig att
+problemet berodde på att testdata från `BudgetRepositoryTest` hade persisterat i
+utvecklingsdatabasen. Specifikt hade ett test, som verifierar hanteringen av
+ogiltiga perioder, skapat en budget med perioden `hourly`. Denna budget låg kvar
+i databasen eftersom systemet inte nollställer databasen mellan testkörningar.
+
+Samma grundproblem verkar också orsaka att vissa tester misslyckas på grund av
+duplicerade data. Att inte nollställa databasen mellan tester verkar vara ett
+medvetet val, men jag har svårt att förstå logiken bakom det. För mig framstår
+det som en enkel och självklar lösning att återställa databasen inför varje
+testkörning, men jag misstänker att det finns en bakomliggande anledning som jag
+ännu inte har greppat.
 
 Jag har skickat mina frågor och observationer till projektets grundare men har i
 skrivande stund inte fått något svar. Jag hoppas dock att en dialog kan leda
